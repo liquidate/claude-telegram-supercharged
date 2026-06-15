@@ -1756,6 +1756,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const text = args.text as string;
         const reply_to = args.reply_to != null ? Number(args.reply_to) : undefined;
         const thread_id = args.thread_id != null ? Number(args.thread_id) : undefined;
+
+        // The reply is arriving, so stop the live "working" feedback loop and
+        // clear its transient status message for this chat.
+        endTurn(chat_id);
         const files = (args.files as string[] | undefined) ?? [];
         const rawParseMode = (args.parse_mode as string | undefined) ?? "MarkdownV2";
         const parseMode = rawParseMode === "plain" ? undefined : (rawParseMode as "MarkdownV2" | "HTML");
@@ -3110,6 +3114,86 @@ function flushBatch(chatId: string): void {
   });
 }
 
+// ── Live "working" feedback (per-chat turn tracker) ─────────────────
+// A Telegram user gets none of Claude Code's spinner / elapsed / token
+// stream, so a 70s answer looks identical to a hang. While Claude composes
+// a reply we keep them informed:
+//   #1 continuous typing indicator (Telegram's own lasts ~5s, so refresh it)
+//   #2 an elapsed-time status message once a turn runs slow
+//   #4 a wedge warning if it runs unusually long, or stalls with no reply
+// The status message is deleted when the real reply lands so the chat stays
+// clean. Step-level interstitials (#3) layer on from the transcript watcher.
+const FB_TYPING_MS = 4000; // refresh typing every 4s (Telegram shows ~5s)
+const FB_STATUS_AFTER_MS = 15000; // show elapsed status once a turn passes 15s
+const FB_WEDGE_MS = 75000; // "taking longer than usual" past 75s
+const FB_STUCK_MS = 300000; // stop the loop and warn "may be stuck" at 5min
+
+interface ActiveTurn {
+  startedAt: number;
+  timer: ReturnType<typeof setInterval>;
+  statusMsgId?: number;
+  lastStatusText?: string;
+}
+const activeTurns = new Map<string, ActiveTurn>();
+
+// Post-or-edit the single status message for a chat. Dedupes identical text
+// so we never spam edits (Telegram throttles edits on the same message).
+async function setTurnStatus(chat_id: string, turn: ActiveTurn, text: string): Promise<void> {
+  if (turn.lastStatusText === text) return;
+  turn.lastStatusText = text;
+  try {
+    if (turn.statusMsgId == null) {
+      const sent = await bot.api.sendMessage(chat_id, text);
+      turn.statusMsgId = sent.message_id;
+    } else {
+      await bot.api.editMessageText(chat_id, turn.statusMsgId, text);
+    }
+  } catch {
+    // best-effort; a failed status update must never break the conversation
+  }
+}
+
+// Begin (or refresh) the feedback loop for a chat. Idempotent: batched
+// messages call this repeatedly without resetting the clock.
+function startTurn(chat_id: string): void {
+  void bot.api.sendChatAction(chat_id, "typing").catch(() => {});
+  if (activeTurns.has(chat_id)) return;
+  const turn: ActiveTurn = {
+    startedAt: Date.now(),
+    timer: undefined as unknown as ReturnType<typeof setInterval>,
+  };
+  turn.timer = setInterval(() => {
+    const t = activeTurns.get(chat_id);
+    if (!t) return;
+    const elapsed = Date.now() - t.startedAt;
+    void bot.api.sendChatAction(chat_id, "typing").catch(() => {}); // #1
+    // 10s granularity so the status edits ~every 10s, not every tick.
+    const shown = Math.max(10, Math.round(elapsed / 10000) * 10);
+    if (elapsed >= FB_STUCK_MS) {
+      void setTurnStatus(chat_id, t, "This is taking unusually long, I may be stuck on it. Try resending in a moment.");
+      clearInterval(t.timer);
+      activeTurns.delete(chat_id);
+    } else if (elapsed >= FB_WEDGE_MS) {
+      void setTurnStatus(chat_id, t, `Still working on this one, it is taking longer than usual (${shown}s).`);
+    } else if (elapsed >= FB_STATUS_AFTER_MS) {
+      void setTurnStatus(chat_id, t, `Working on it... (${shown}s)`);
+    }
+  }, FB_TYPING_MS);
+  activeTurns.set(chat_id, turn);
+}
+
+// End the feedback loop for a chat (the reply has arrived) and clean up the
+// transient status message.
+function endTurn(chat_id: string): void {
+  const turn = activeTurns.get(chat_id);
+  if (!turn) return;
+  clearInterval(turn.timer);
+  activeTurns.delete(chat_id);
+  if (turn.statusMsgId != null) {
+    void bot.api.deleteMessage(chat_id, turn.statusMsgId).catch(() => {});
+  }
+}
+
 async function handleInbound(
   ctx: Context,
   inboundText: string,
@@ -3168,8 +3252,10 @@ async function deliverMessage(
   const chat_id = String(ctx.chat!.id);
   const msgId = ctx.message?.message_id;
 
-  // Typing indicator — signals "processing" until we reply (or ~5s elapses).
-  void bot.api.sendChatAction(chat_id, "typing").catch(() => {});
+  // Live "working" feedback: continuous typing + elapsed status + wedge
+  // detection until the reply lands. Replaces the old one-shot typing, which
+  // Telegram dropped after ~5s and left the user staring at silence.
+  startTurn(chat_id);
 
   // Ack reaction — only for single messages (not during a burst).
   // During batching, skip individual ack reactions to avoid spamming.
