@@ -3128,7 +3128,7 @@ function flushBatch(chatId: string): void {
 // The status message is deleted when the real reply lands so the chat stays
 // clean. Step-level interstitials (#3) layer on from the transcript watcher.
 const FB_TYPING_MS = 4000; // refresh typing every 4s (Telegram shows ~5s)
-const FB_STATUS_AFTER_MS = 15000; // show elapsed status once a turn passes 15s
+const FB_STATUS_AFTER_MS = 10000; // show elapsed status once a turn passes 10s
 const FB_WEDGE_MS = 75000; // "taking longer than usual" past 75s
 const FB_STUCK_MS = 300000; // stop the loop and warn "may be stuck" at 5min
 
@@ -3214,10 +3214,9 @@ function endTurn(chat_id: string): void {
 // message (it's a surfacing problem, not new instrumentation). Our own cwd is
 // the plugin dir, so we resolve Claude's working directory (our grandparent,
 // same as the orphan watchdog) to locate its projects dir.
-let cachedProjectsDir: string | null | undefined; // undefined = not yet resolved
+let cachedProjectsDir: string | null = null; // null = not yet resolved (retry on miss)
 function resolveProjectsDir(): string | null {
-  if (cachedProjectsDir !== undefined) return cachedProjectsDir;
-  cachedProjectsDir = null;
+  if (cachedProjectsDir) return cachedProjectsDir;
   try {
     const claudePid = resolveGrandparentPid(
       process.ppid,
@@ -3237,17 +3236,20 @@ function resolveProjectsDir(): string | null {
         }
       },
     );
-    if (!claudePid) return cachedProjectsDir;
-    const cwd = readlinkSync(`/proc/${claudePid}/cwd`);
+    const cwd = claudePid ? readlinkSync(`/proc/${claudePid}/cwd`) : "";
     // Claude encodes the workspace path into the projects dir name by replacing
     // "/" and "." with "-" (verified against the live dirs).
     const encoded = cwd.replace(/[/.]/g, "-");
-    const dir = join(homedir(), ".claude", "projects", encoded);
-    if (existsSync(dir)) cachedProjectsDir = dir;
+    const dir = cwd ? join(homedir(), ".claude", "projects", encoded) : "";
+    const ok = !!dir && existsSync(dir);
+    if (ok) {
+      cachedProjectsDir = dir;
+      return dir;
+    }
   } catch {
     // best-effort; step-progress simply won't show if we can't resolve it
   }
-  return cachedProjectsDir;
+  return null; // resolution failed; do not cache, retry on the next call
 }
 
 function latestTranscript(): string | undefined {
@@ -3294,7 +3296,14 @@ function stepLabel(toolName: string): string | undefined {
 // Read new transcript bytes since the last check and update the turn's current
 // step from the most recent tool_use. Synchronous and best-effort.
 function updateStep(turn: ActiveTurn): void {
-  if (!turn.transcriptPath) return;
+  if (!turn.transcriptPath) {
+    // First turn after a fresh restart: the session JSONL may not have existed
+    // when startTurn ran. Pick it up now and read it from the start.
+    const tp = latestTranscript();
+    if (!tp) return;
+    turn.transcriptPath = tp;
+    turn.transcriptOffset = 0;
+  }
   try {
     const size = statSync(turn.transcriptPath).size;
     if (size <= turn.transcriptOffset) return; // nothing new (or file rotated)
