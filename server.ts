@@ -13,10 +13,14 @@ import { Database } from "bun:sqlite";
 import { execSync, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
+  closeSync,
   existsSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  readSync,
   readdirSync,
+  readlinkSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -3133,6 +3137,10 @@ interface ActiveTurn {
   timer: ReturnType<typeof setInterval>;
   statusMsgId?: number;
   lastStatusText?: string;
+  // #3 interstitial step-progress, read from the session transcript
+  transcriptPath?: string;
+  transcriptOffset: number;
+  currentStep?: string;
 }
 const activeTurns = new Map<string, ActiveTurn>();
 
@@ -3158,25 +3166,30 @@ async function setTurnStatus(chat_id: string, turn: ActiveTurn, text: string): P
 function startTurn(chat_id: string): void {
   void bot.api.sendChatAction(chat_id, "typing").catch(() => {});
   if (activeTurns.has(chat_id)) return;
+  const tp = latestTranscript();
   const turn: ActiveTurn = {
     startedAt: Date.now(),
     timer: undefined as unknown as ReturnType<typeof setInterval>,
+    transcriptPath: tp,
+    transcriptOffset: tp ? transcriptSize(tp) : 0,
   };
   turn.timer = setInterval(() => {
     const t = activeTurns.get(chat_id);
     if (!t) return;
     const elapsed = Date.now() - t.startedAt;
     void bot.api.sendChatAction(chat_id, "typing").catch(() => {}); // #1
+    updateStep(t); // #3: surface the latest step from the transcript
     // 10s granularity so the status edits ~every 10s, not every tick.
     const shown = Math.max(10, Math.round(elapsed / 10000) * 10);
+    const step = t.currentStep ?? "Working on it";
     if (elapsed >= FB_STUCK_MS) {
       void setTurnStatus(chat_id, t, "This is taking unusually long, I may be stuck on it. Try resending in a moment.");
       clearInterval(t.timer);
       activeTurns.delete(chat_id);
     } else if (elapsed >= FB_WEDGE_MS) {
-      void setTurnStatus(chat_id, t, `Still working on this one, it is taking longer than usual (${shown}s).`);
+      void setTurnStatus(chat_id, t, `${step}... taking longer than usual (${shown}s)`);
     } else if (elapsed >= FB_STATUS_AFTER_MS) {
-      void setTurnStatus(chat_id, t, `Working on it... (${shown}s)`);
+      void setTurnStatus(chat_id, t, `${step}... (${shown}s)`);
     }
   }, FB_TYPING_MS);
   activeTurns.set(chat_id, turn);
@@ -3191,6 +3204,127 @@ function endTurn(chat_id: string): void {
   activeTurns.delete(chat_id);
   if (turn.statusMsgId != null) {
     void bot.api.deleteMessage(chat_id, turn.statusMsgId).catch(() => {});
+  }
+}
+
+// ── #3 interstitial step-progress: read steps from the session transcript ──
+// The bot's tool calls (querying, searching, etc.) go to other MCP servers, so
+// this poller never sees them directly. But Claude writes every step to its
+// session JSONL, so we tail that and surface the current step into the status
+// message (it's a surfacing problem, not new instrumentation). Our own cwd is
+// the plugin dir, so we resolve Claude's working directory (our grandparent,
+// same as the orphan watchdog) to locate its projects dir.
+let cachedProjectsDir: string | null | undefined; // undefined = not yet resolved
+function resolveProjectsDir(): string | null {
+  if (cachedProjectsDir !== undefined) return cachedProjectsDir;
+  cachedProjectsDir = null;
+  try {
+    const claudePid = resolveGrandparentPid(
+      process.ppid,
+      (pid) => {
+        try {
+          return readFileSync(`/proc/${pid}/stat`, "utf-8");
+        } catch {
+          return null;
+        }
+      },
+      (pid) => {
+        try {
+          const n = Number.parseInt(execSync(`ps -o ppid= -p ${pid}`, { encoding: "utf-8" }).trim(), 10);
+          return Number.isFinite(n) ? n : null;
+        } catch {
+          return null;
+        }
+      },
+    );
+    if (!claudePid) return cachedProjectsDir;
+    const cwd = readlinkSync(`/proc/${claudePid}/cwd`);
+    // Claude encodes the workspace path into the projects dir name by replacing
+    // "/" and "." with "-" (verified against the live dirs).
+    const encoded = cwd.replace(/[/.]/g, "-");
+    const dir = join(homedir(), ".claude", "projects", encoded);
+    if (existsSync(dir)) cachedProjectsDir = dir;
+  } catch {
+    // best-effort; step-progress simply won't show if we can't resolve it
+  }
+  return cachedProjectsDir;
+}
+
+function latestTranscript(): string | undefined {
+  const dir = resolveProjectsDir();
+  if (!dir) return undefined;
+  try {
+    const files = readdirSync(dir)
+      .filter((f) => f.endsWith(".jsonl"))
+      .map((f) => join(dir, f));
+    if (files.length === 0) return undefined;
+    return files.sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs)[0];
+  } catch {
+    return undefined;
+  }
+}
+
+function transcriptSize(path: string): number {
+  try {
+    return statSync(path).size;
+  } catch {
+    return 0;
+  }
+}
+
+// Map a tool name to a short user-facing phrase, or undefined to ignore it
+// (the telegram tools themselves are not meaningful steps to surface).
+function stepLabel(toolName: string): string | undefined {
+  const n = toolName.toLowerCase();
+  if (n.includes("telegram") || n.endsWith("reply") || n.endsWith("react") || n.includes("typing")) return undefined;
+  if (n.includes("library")) return "Checking the library";
+  if (n.includes("query") || n.includes("sql") || n.includes("duckdb") || n.includes("warehouse")) return "Querying the data";
+  if (n.includes("mam") && n.includes("search")) return "Searching for editions";
+  if (n.includes("torrent") || n.includes("qbit")) return "Queueing the download";
+  if (n.includes("web_search") || (n.includes("exa") && n.includes("search")) || n === "websearch") return "Searching the web";
+  if (n.includes("web_fetch") || n.includes("fetch") || n.includes("read_url")) return "Reading a page";
+  if (n === "bash") return "Running a command";
+  if (n === "read" || n.endsWith("__read")) return "Reading files";
+  if (n === "edit" || n === "write" || n === "notebookedit") return "Writing the result";
+  if (n === "grep" || n === "glob") return "Searching files";
+  if (n === "task" || n.includes("agent")) return "Working on a sub-task";
+  return "Working"; // generic for unknown tools
+}
+
+// Read new transcript bytes since the last check and update the turn's current
+// step from the most recent tool_use. Synchronous and best-effort.
+function updateStep(turn: ActiveTurn): void {
+  if (!turn.transcriptPath) return;
+  try {
+    const size = statSync(turn.transcriptPath).size;
+    if (size <= turn.transcriptOffset) return; // nothing new (or file rotated)
+    const len = size - turn.transcriptOffset;
+    const fd = openSync(turn.transcriptPath, "r");
+    const buf = Buffer.alloc(len);
+    readSync(fd, buf, 0, len, turn.transcriptOffset);
+    closeSync(fd);
+    turn.transcriptOffset = size;
+    for (const line of buf.toString("utf8").split("\n")) {
+      const s = line.trim();
+      if (!s) continue;
+      let o: { type?: string; message?: { content?: unknown } };
+      try {
+        o = JSON.parse(s);
+      } catch {
+        continue;
+      }
+      const content = o.message?.content;
+      if (o.type === "assistant" && Array.isArray(content)) {
+        for (const it of content as Array<{ type?: string; name?: string }>) {
+          if (it?.type === "tool_use" && typeof it.name === "string") {
+            const label = stepLabel(it.name);
+            if (label) turn.currentStep = label;
+          }
+        }
+      }
+    }
+  } catch {
+    // best-effort; never break the conversation over a transcript read
   }
 }
 
