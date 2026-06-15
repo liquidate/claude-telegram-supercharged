@@ -841,6 +841,24 @@ class MessageStore {
       .all(chatId, `%${escaped}%`, limit) as Array<Record<string, unknown>>;
   }
 
+  /** The latest inbound (user) message per chat with nothing after it, newer
+   *  than `since` (epoch seconds): a message we received but never answered
+   *  (no outgoing reply followed it). Used to re-ask after a restart that
+   *  interrupted a turn. */
+  lastUnansweredInbound(since: number): Array<Record<string, unknown>> {
+    return this.db
+      .query(
+        `SELECT m.* FROM messages m
+         WHERE m.is_outgoing = 0 AND m.date >= ?
+           AND NOT EXISTS (
+             SELECT 1 FROM messages x
+             WHERE x.chat_id = m.chat_id
+               AND (x.date > m.date OR (x.date = m.date AND x.id > m.id))
+           )`,
+      )
+      .all(since) as Array<Record<string, unknown>>;
+  }
+
   /** Format last N messages for injection into Claude's context. */
   formatRecent(chatId: string, count = 5): string {
     const msgs = this.getHistory(chatId, count);
@@ -2247,6 +2265,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 if (import.meta.main) {
   await mcp.connect(new StdioServerTransport());
   startOrphanWatchdog();
+  // Re-ask the user's last message if we restarted before answering it. Delayed
+  // so Claude's session (a --continue resume) is up and ready to process the
+  // channel notification before we send it.
+  setTimeout(() => reinjectUnanswered(), 15_000);
 }
 
 /**
@@ -3204,6 +3226,51 @@ function endTurn(chat_id: string): void {
   activeTurns.delete(chat_id);
   if (turn.statusMsgId != null) {
     void bot.api.deleteMessage(chat_id, turn.statusMsgId).catch(() => {});
+  }
+}
+
+// ── Re-ask the last unanswered message after a restart ──────────────────────
+// If we restarted (drift recovery, crash, or deploy) while a user's most recent
+// message was still unanswered, re-deliver it through the normal channel path so
+// Claude answers it without the user having to re-send. The message store and its
+// last-5 history survive the restart, so the model gets context too. Bounded to a
+// short look-back so a long-idle bot never resurrects a stale message, and skipped
+// when a live turn is already handling the chat (avoids double-processing if the
+// poller redelivered the same update).
+const REINJECT_MAX_AGE_MS = 30 * 60 * 1000;
+function reinjectUnanswered(): void {
+  let pending: Array<Record<string, unknown>>;
+  try {
+    const since = Math.floor((Date.now() - REINJECT_MAX_AGE_MS) / 1000);
+    pending = messageStore.lastUnansweredInbound(since);
+  } catch {
+    return;
+  }
+  for (const m of pending) {
+    const chatId = String(m.chat_id);
+    if (activeTurns.has(chatId)) continue; // a live turn is already handling this chat
+    const text = ((m.text as string | null) ?? (m.caption as string | null) ?? "").trim();
+    if (!text) continue; // v1: pure-media messages are handled on the user's next turn
+    const recentHistory = messageStore.formatRecent(chatId, 5);
+    const note =
+      "[System notice: the bot restarted before answering the user's most recent message, shown below. The user has NOT re-sent it. Answer it now and deliver your answer with the reply tool.]";
+    const body = `${note}\n\n${text}`;
+    const content = recentHistory ? `${body}\n\n${recentHistory}` : body;
+    void mcp.notification({
+      method: "notifications/claude/channel",
+      params: {
+        content,
+        meta: {
+          chat_id: chatId,
+          message_id: m.message_id != null ? String(m.message_id) : undefined,
+          user: (m.username as string | null) ?? undefined,
+          user_id: (m.user_id as string | null) ?? undefined,
+          ts: new Date(Number(m.date) * 1000).toISOString(),
+        },
+      },
+    });
+    startTurn(chatId);
+    process.stderr.write(`telegram channel: re-injected unanswered message ${m.message_id} for chat ${chatId}\n`);
   }
 }
 
